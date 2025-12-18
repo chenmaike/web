@@ -8,6 +8,8 @@ Feature: Explicitly logs and plots WSR (Mbps) to verify convergence and trade-of
 import os
 import math
 import random
+import json
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
@@ -227,9 +229,7 @@ class Env:
             ServingAP.append(chosen)
         return ServingAP, infeasible
 
-    def step(self, action):
-        ServingAP, infeasible = self._decode_action(action)
-        
+    def _evaluate_action(self, ServingAP: List[np.ndarray], infeasible: float) -> Dict[str, float]:
         pilots = wgf_pilot_assignment(self.Beta.astype(np.float64), ServingAP, self.lp)
         C_est = compute_C_est(self.Beta.astype(np.float64), pilots, self.lp, self.rho_p)
         Eta = compute_Eta(C_est, ServingAP)
@@ -264,48 +264,39 @@ class Env:
 
         wsr = float(np.sum(self.w_k * (S_bar * (self.B / self.n))))
         
-        # === 修改后的平滑奖励逻辑 ===
         eps = float(self.eps_target_sys)
         worst_dvp = float(np.max(dvp))
-        safe_dvp = max(worst_dvp, 1e-12) # 防止 log 报错
+        safe_dvp = max(worst_dvp, 1e-12)
         
-        # 归一化 WSR (0.0 ~ 1.2 左右)
         r_wsr = wsr / self.R_ref_bps
-        
-        # 计算违背程度 (log space)
-        # 如果 DVP = 1e-2 (目标), log_term = 0
-        # 如果 DVP = 1e-1, log_term = 1.0
-        # 如果 DVP = 1e-3, log_term = -1.0
         log_term = math.log10(safe_dvp / eps)
         
-        # 惩罚系数
-        lambda_p = 1.0 
-        
-        # 组合奖励：
-        # 1. 基础 WSR 奖励
-        # 2. 如果 DVP > eps (log_term > 0)，施加惩罚
-        # 3. 如果 DVP < eps (log_term < 0)，给予微小奖励或不惩罚
-        # 使用 Softplus 或 ReLU 变体来平滑
-        
         if log_term > 0:
-            # 越界了：线性扣分，不要太狠，给它改过的机会
-            # 之前的 5.0 太大了，改成 2.0 甚至 1.0
             penalty = 2.0 * log_term 
             reward = r_wsr - penalty
         else:
-            # 安全区域：
-            # 稍微给一点点正反馈，鼓励更低的时延，但主要还是看 WSR
-            reward = r_wsr - 0.1 * log_term # 注意 log_term 是负数，这里变成加分
+            reward = r_wsr - 0.1 * log_term
             
         reward -= (self.infeasible_penalty * infeasible)
 
-        next_state = self.reset()
-        info = {
+        return {
             'wsr_bps': wsr,
             'worst_dvp': worst_dvp,
-            'reward': float(reward)
+            'reward': float(reward),
+            'constraint_satisfied': float(worst_dvp <= eps)
         }
-        return next_state, float(reward), True, info
+
+    def step(self, action):
+        ServingAP, infeasible = self._decode_action(action)
+        metrics = self._evaluate_action(ServingAP, infeasible)
+
+        next_state = self.reset()
+        info = {
+            'wsr_bps': metrics['wsr_bps'],
+            'worst_dvp': metrics['worst_dvp'],
+            'reward': metrics['reward']
+        }
+        return next_state, float(metrics['reward']), True, info
 
 # =============================================================================
 # 3) GNN & Agent
@@ -350,6 +341,57 @@ def plackett_luce_sample(logits: torch.Tensor, S: int) -> Tuple[torch.Tensor, to
     log_probs = F.log_softmax(logits, dim=-1)
     selected_logp = torch.gather(log_probs, -1, act_idx).sum(dim=(1, 2))
     return act_idx, selected_logp
+
+
+def evaluate(env: Env, policy: nn.Module, candidate_mask: torch.Tensor, mode: str = "ppo", runs: int = 1,
+             temperature: float = None, greedy_top_s: bool = True) -> Dict[str, float]:
+    assert mode in {"ppo", "greedy"}
+    results = []
+    if mode == "ppo" and policy is not None:
+        policy.eval()
+    for _ in range(runs):
+        if not env.fixed_positions:
+            env._sample_positions()
+        Beta = env.Beta.reshape(env.M_ap, env.K)
+
+        if mode == "greedy":
+            action = np.argsort(-Beta, axis=0)[:env.S, :].T
+        else:
+            Beta_t = torch.from_numpy(Beta).float().to(env.device).unsqueeze(0)
+            with torch.no_grad():
+                logits = policy(Beta_t, candidate_mask)
+                if temperature is not None and temperature > 0 and not greedy_top_s:
+                    scaled_logits = logits / float(temperature)
+                    act_idx, _ = plackett_luce_sample(scaled_logits, env.S)
+                else:
+                    act_idx = torch.topk(logits, k=env.S, dim=-1).indices
+                action = act_idx.squeeze(0).cpu().numpy()
+
+        ServingAP, infeasible = env._decode_action(action)
+        metrics = env._evaluate_action(ServingAP, infeasible)
+        results.append(metrics)
+
+    avg_wsr = float(np.mean([r['wsr_bps'] for r in results]) / 1e6)
+    avg_worst_dvp = float(np.mean([r['worst_dvp'] for r in results]))
+    constraint_rate = float(np.mean([r['constraint_satisfied'] for r in results]))
+    return {
+        "mode": mode,
+        "avg_wsr_mbps": avg_wsr,
+        "avg_worst_dvp": avg_worst_dvp,
+        "constraint_rate": constraint_rate
+    }
+
+
+def save_eval_results(results: List[Dict[str, float]], json_path: str = "eval_results.json", csv_path: str = "eval_results.csv"):
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    fieldnames = ["mode", "avg_wsr_mbps", "avg_worst_dvp", "constraint_rate"]
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
 
 # =============================================================================
 # 4) Training Loop
@@ -465,6 +507,23 @@ def train(cfg: Dict):
                 avg_wsr = np.mean(metrics["wsr"][-cfg["batch_size"]:])
                 print(f"[Iter {it+1:04d}] Reward: {avg_r:.3f} | WSR: {avg_wsr:.2f} Mbps | WorstDVP: {avg_wdvp:.2e}")
 
+    print("\n=== [Phase 3] Evaluation ===")
+    eval_runs = int(cfg.get("eval_runs", 1))
+    eval_temp = cfg.get("eval_temperature", None)
+    greedy_top_s = bool(cfg.get("eval_greedy_top", True))
+
+    greedy_res = evaluate(env, policy, candidate_mask, mode="greedy", runs=eval_runs)
+    ppo_res = evaluate(env, policy, candidate_mask, mode="ppo", runs=eval_runs, temperature=eval_temp, greedy_top_s=greedy_top_s)
+    eval_results = [greedy_res, ppo_res]
+    save_eval_results(eval_results)
+
+    print("Evaluation summary (average over runs):")
+    for res in eval_results:
+        print(
+            f" - {res['mode'].upper():6s} | WSR: {res['avg_wsr_mbps']:.3f} Mbps | "
+            f"Worst DVP: {res['avg_worst_dvp']:.2e} | Constraint rate: {res['constraint_rate']:.2%}"
+        )
+
     # Plot
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
@@ -481,6 +540,8 @@ def train(cfg: Dict):
     if len(metrics["wsr"]) > w:
         ma = np.convolve(metrics["wsr"], np.ones(w)/w, mode='valid')
         axes[1].plot(range(w-1, len(metrics["wsr"])), ma, color='tab:orange', linewidth=2)
+    axes[1].axhline(y=greedy_res["avg_wsr_mbps"], color='gray', linestyle='--', label=f"Greedy: {greedy_res['avg_wsr_mbps']:.2f} Mbps")
+    axes[1].legend()
         
     # 3. DVP
     dvp_np = np.maximum(np.array(metrics["worst_dvp"]), 1e-16)
@@ -520,6 +581,11 @@ if __name__ == "__main__":
         infeasible_penalty=0.1,
         P_AP_W=1.0, noise_figure_db=5.0, rho_p=10.0,
         area=500.0, d0=36.0, alpha_path=3.6,
-        num_quantiles=50, fixed_positions=True, hidden=128, hidden_v=256
+        num_quantiles=50, fixed_positions=True, hidden=128, hidden_v=256,
+        # 评估相关
+        eval_runs=3,
+        eval_temperature=None,
+        eval_greedy_top=True
     )
     train(cfg)
+
