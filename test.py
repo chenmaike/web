@@ -161,7 +161,7 @@ class Env:
         self.fixed_positions = cfg.get("fixed_positions", True)
         self.num_quantiles = cfg["num_quantiles"]
         self.R_ref_bps = cfg["R_ref_bps"]
-        self.infeasible_penalty = cfg["infeasible_penalty"]
+        self.infeasible_penalty = max(float(cfg["infeasible_penalty"]), 1.0)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         P_noise_W = 10 ** ((-174.0 + 10.0 * math.log10(self.B) + float(cfg["noise_figure_db"]) - 30.0) / 10.0)
@@ -174,9 +174,18 @@ class Env:
         self._area = float(cfg["area"])
         self._d0 = float(cfg["d0"])
         self._alpha_path = float(cfg["alpha_path"])
-        
+
         self._sample_positions()
-        
+        self.candidate_mask = self.get_candidate_mask(top_k_candidates=20)
+        self.candidate_mask_np = self.candidate_mask.cpu().numpy() >= -1e-6
+
+        self.lambda_min = float(cfg.get("lambda_min", 0.5))
+        self.lambda_max = float(cfg.get("lambda_max", 50.0))
+        self.lambda_increase = float(cfg.get("lambda_increase", 0.25))
+        self.lambda_decrease = float(cfg.get("lambda_decrease", 0.05))
+        self.lambda_gain = float(cfg.get("lambda_gain", 2.0))
+        self.lambda_p = self.lambda_min
+
         eps_k = np.full((self.K,), self.eps_target_sys, dtype=np.float32)
         dth_k = np.full((self.K,), self.d_th_time, dtype=np.float32)
         w = (np.log(1.0 / eps_k) / dth_k).astype(np.float64)
@@ -196,15 +205,19 @@ class Env:
         self.Beta = self._compute_Beta(d0=self._d0, alpha_path=self._alpha_path)
 
     def get_candidate_mask(self, top_k_candidates=20):
-        mask = torch.full((self.K, self.M_ap), -1e9, device=self.device)
+        mask = torch.full((self.K, self.M_ap), -1e9, device=self.device) 
         Beta_t = torch.from_numpy(self.Beta.T).to(self.device) 
         _, indices = torch.topk(Beta_t, k=top_k_candidates, dim=1)
         mask.scatter_(1, indices, 0.0)
+        self.candidate_mask = mask
+        self.candidate_mask_np = mask.cpu().numpy() >= -1e-6
         return mask
 
     def reset(self):
         if not self.fixed_positions:
             self._sample_positions()
+            self.candidate_mask = self.get_candidate_mask(top_k_candidates=20)
+            self.candidate_mask_np = self.candidate_mask.cpu().numpy() >= -1e-6
         return np.concatenate([self.Beta.reshape(-1), np.array([self.N_ant], dtype=np.float32)], axis=0).astype(np.float32)
 
     def _decode_action(self, action):
@@ -212,17 +225,31 @@ class Env:
         ServingAP = []
         for k in range(self.K):
             chosen = action[k].astype(np.int64)
-            if np.any(chosen < 0) or np.any(chosen >= self.M_ap):
-                infeasible += 1.0
-                chosen = np.clip(chosen, 0, self.M_ap - 1)
+            invalid_mask = (chosen < 0) | (chosen >= self.M_ap)
+            if np.any(invalid_mask):
+                infeasible += 1.5 * np.sum(invalid_mask)
+                chosen = chosen[~invalid_mask]
+            allowed_mask = None
+            if getattr(self, "candidate_mask_np", None) is not None:
+                allowed_mask = self.candidate_mask_np[k]
+            if allowed_mask is not None and chosen.size > 0:
+                invalid_candidates = ~allowed_mask[chosen]
+                if np.any(invalid_candidates):
+                    infeasible += 1.0 * np.sum(invalid_candidates)
+                    chosen = chosen[~invalid_candidates]
             u = np.unique(chosen)
             if len(u) < len(chosen):
-                infeasible += 0.5 
+                infeasible += 1.0
                 chosen = u
             if chosen.size == 0:
-                infeasible += 1.0
-                chosen = np.array([int(np.argmax(self.Beta[:, k]))], dtype=np.int64)
+                infeasible += 1.5
+                if allowed_mask is not None:
+                    fallback = np.argmax(self.Beta[:, k] * allowed_mask.astype(np.float64))
+                else:
+                    fallback = np.argmax(self.Beta[:, k])
+                chosen = np.array([int(fallback)], dtype=np.int64)
             if chosen.size > self.S:
+                infeasible += 0.5 * (chosen.size - self.S)
                 chosen = chosen[: self.S]
             ServingAP.append(chosen)
         return ServingAP, infeasible
@@ -272,38 +299,28 @@ class Env:
         # 归一化 WSR (0.0 ~ 1.2 左右)
         r_wsr = wsr / self.R_ref_bps
         
-        # 计算违背程度 (log space)
-        # 如果 DVP = 1e-2 (目标), log_term = 0
-        # 如果 DVP = 1e-1, log_term = 1.0
-        # 如果 DVP = 1e-3, log_term = -1.0
-        log_term = math.log10(safe_dvp / eps)
-        
-        # 惩罚系数
-        lambda_p = 1.0 
-        
-        # 组合奖励：
-        # 1. 基础 WSR 奖励
-        # 2. 如果 DVP > eps (log_term > 0)，施加惩罚
-        # 3. 如果 DVP < eps (log_term < 0)，给予微小奖励或不惩罚
-        # 使用 Softplus 或 ReLU 变体来平滑
-        
-        if log_term > 0:
-            # 越界了：线性扣分，不要太狠，给它改过的机会
-            # 之前的 5.0 太大了，改成 2.0 甚至 1.0
-            penalty = 2.0 * log_term 
-            reward = r_wsr - penalty
+        # 自适应拉格朗日系数：超标时递增，低于阈值缓降
+        dvp_ratio = safe_dvp / eps
+        log_term = math.log(dvp_ratio + 1e-12)
+        lambda_candidate = max(self.lambda_min, self.lambda_gain * max(0.0, log_term))
+        if dvp_ratio > 1.0:
+            growth = 1.0 + self.lambda_increase * (dvp_ratio - 1.0)
+            self.lambda_p = min(self.lambda_max, max(self.lambda_p * growth, lambda_candidate))
         else:
-            # 安全区域：
-            # 稍微给一点点正反馈，鼓励更低的时延，但主要还是看 WSR
-            reward = r_wsr - 0.1 * log_term # 注意 log_term 是负数，这里变成加分
-            
-        reward -= (self.infeasible_penalty * infeasible)
+            decay = 1.0 - self.lambda_decrease * (1.0 - dvp_ratio)
+            self.lambda_p = max(self.lambda_min, min(self.lambda_max, self.lambda_p * decay))
+            self.lambda_p = max(self.lambda_p, lambda_candidate)
+
+        soft_barrier = self.lambda_p * math.log1p(math.exp(log_term))
+        reward = r_wsr - soft_barrier - (self.infeasible_penalty * infeasible)
 
         next_state = self.reset()
         info = {
             'wsr_bps': wsr,
             'worst_dvp': worst_dvp,
-            'reward': float(reward)
+            'reward': float(reward),
+            'lambda_p': float(self.lambda_p),
+            'infeasible': float(infeasible)
         }
         return next_state, float(reward), True, info
 
